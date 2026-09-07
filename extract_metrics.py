@@ -68,30 +68,35 @@ JIRA_BASE_URL = f"https://{JIRA_DOMAIN}"
 # ---------------------------------------------------------------------------
 
 def jira_search(jql: str, fields: list[str]) -> list[dict]:
-    """Pagina /rest/api/3/search y devuelve todos los issues que matchean el JQL."""
+    """
+    Pagina el endpoint 'enhanced JQL search' (POST /rest/api/3/search/jql) y
+    devuelve todos los issues que matchean el JQL.
+
+    NOTA: el endpoint viejo (GET /rest/api/3/search) fue deprecado por
+    Atlassian y devuelve 410 Gone. Este usa el reemplazo oficial, que pagina
+    con nextPageToken en vez de startAt/total.
+    """
     issues = []
-    start_at = 0
-    max_results = 100
+    next_page_token = None
 
     while True:
-        resp = requests.get(
-            f"{JIRA_BASE_URL}/rest/api/3/search",
+        body = {"jql": jql, "maxResults": 100, "fields": fields}
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
+
+        resp = requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
             auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            headers={"Accept": "application/json"},
-            params={
-                "jql": jql,
-                "fields": ",".join(fields),
-                "startAt": start_at,
-                "maxResults": max_results,
-            },
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=body,
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
         issues.extend(data.get("issues", []))
 
-        start_at += max_results
-        if start_at >= data.get("total", 0):
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token or data.get("isLast", True):
             break
 
     return issues
@@ -117,36 +122,9 @@ def find_story_points_field(issue_fields: dict) -> float:
 
 
 def get_sprint_metrics() -> dict:
-    fields = ["status", "statuscategorychangedate", *[]]
     # Traemos todos los campos para poder detectar story points sin conocer el ID exacto
     jql = f'project = {JIRA_PROJECT_KEY} AND sprint in openSprints() ORDER BY updated DESC'
-
-    resp = requests.get(
-        f"{JIRA_BASE_URL}/rest/api/3/search",
-        auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-        headers={"Accept": "application/json"},
-        params={"jql": jql, "fields": "*all", "maxResults": 100},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    issues = data.get("issues", [])
-
-    # Paginación si hay más de 100 issues en el sprint
-    total = data.get("total", 0)
-    start_at = 100
-    while start_at < total:
-        resp = requests.get(
-            f"{JIRA_BASE_URL}/rest/api/3/search",
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            headers={"Accept": "application/json"},
-            params={"jql": jql, "fields": "*all", "startAt": start_at, "maxResults": 100},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        page = resp.json()
-        issues.extend(page.get("issues", []))
-        start_at += 100
+    issues = jira_search(jql, fields=["*all"])
 
     completed_points = 0.0
     completed_count = 0

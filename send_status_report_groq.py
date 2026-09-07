@@ -152,7 +152,7 @@ def generate_status_report_with_groq(last_metrics: Dict, historical: Dict) -> st
     """
     
     message = client.chat.completions.create(
-        model="mixtral-8x7b-32768",  # Modelo gratuito de Groq
+        model="llama-3.1-70b-versatile",  # Modelo gratuito de Groq (activo)
         max_tokens=1024,
         messages=[
             {"role": "user", "content": context}

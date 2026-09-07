@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Rovo Agent: Lee Google Sheet y genera Status Report narrativo.
+Rovo Agent: Lee Google Sheet y genera Status Report narrativo con Groq.
 Envía email desde cuenta corporativa CDPE.
 
-Requerimientos:
-- google-api-python-client (ya lo tenés)
-- google-auth-httplib2 (ya lo tenés)
-- anthropic (para llamar a Claude/Rovo)
+Groq es GRATIS y no requiere pago.
 """
 
 import os
@@ -18,7 +15,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from anthropic import Anthropic
+from groq import Groq
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -28,12 +25,14 @@ GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 # Email corporativo CDPE
-SMTP_SERVER = "smtp.gmail.com"  # Si usan Google Workspace
+SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")  # ej: metricas@centraldepasajes.com.ar
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")  # App Password o contraseña
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")  # Tu email
+# Groq API
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 # ============================================================================
@@ -94,25 +93,26 @@ def read_historical_metrics(service) -> Dict:
     
     return {
         "rows": historical,
-        "count": len(historical) - 1  # Sin header
+        "count": len(historical) - 1
     }
 
 
 # ============================================================================
-# ROVO AGENT - Generar reporte narrativo
+# GROQ - Generar reporte narrativo
 # ============================================================================
 
-def generate_status_report_with_rovo(last_metrics: Dict, historical: Dict) -> str:
+def generate_status_report_with_groq(last_metrics: Dict, historical: Dict) -> str:
     """
-    Usa Claude (Rovo) para generar un reporte narrativo automático.
+    Usa Groq para generar un reporte narrativo automático.
+    Groq es GRATIS: https://groq.com/
     """
-    client = Anthropic()
+    client = Groq(api_key=GROQ_API_KEY)
     
-    # Preparar contexto para Claude
+    # Preparar contexto para Groq
     context = f"""
     Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
     
-    DATOS ESTA SEMANA (últimas 24h):
+    DATOS ESTA SEMANA:
     - Timestamp: {last_metrics.get('Timestamp', 'N/A')}
     - Puntos completados: {last_metrics.get('Puntos Completados', 'N/A')}
     - Items completados: {last_metrics.get('Items Completados', 'N/A')}
@@ -152,14 +152,14 @@ def generate_status_report_with_rovo(last_metrics: Dict, historical: Dict) -> st
     """
     
     message = client.messages.create(
-        model="claude-opus-4-1-20250805",
+        model="mixtral-8x7b-32768",  # Modelo gratuito de Groq
         max_tokens=1024,
         messages=[
             {"role": "user", "content": context}
         ]
     )
     
-    return message.content[0].text
+    return message.choices[0].message.content
 
 
 # ============================================================================
@@ -182,7 +182,7 @@ def send_status_email(subject: str, html_body: str, recipient: str) -> bool:
         {html_body}
         
         ---
-        Generado automáticamente por Rovo Agent
+        Generado automáticamente por Rovo Agent con Groq (gratis)
         """
         part1 = MIMEText(text_body, "plain")
         
@@ -229,15 +229,15 @@ def send_status_email(subject: str, html_body: str, recipient: str) -> bool:
 
 def main():
     """Orquesta lectura de Sheet, generación de reporte y envío de email."""
-    print("[*] Iniciando Rovo Agent - Status Report...")
+    print("[*] Iniciando Rovo Agent - Status Report (Groq)...")
     
     # Validar variables de entorno
     if not all([GOOGLE_SHEETS_ID, GOOGLE_CREDENTIALS_JSON, 
-                SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
+                SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GROQ_API_KEY]):
         raise ValueError(
             "Faltan variables de entorno: "
             "GOOGLE_SHEETS_ID, GOOGLE_CREDENTIALS_JSON, "
-            "SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL"
+            "SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GROQ_API_KEY"
         )
     
     # Leer datos del Sheet
@@ -252,9 +252,9 @@ def main():
     
     print("[+] Datos leídos exitosamente")
     
-    # Generar reporte con Rovo (Claude)
-    print("[*] Generando reporte con Rovo Agent...")
-    report_content = generate_status_report_with_rovo(last_metrics, historical)
+    # Generar reporte con Groq
+    print("[*] Generando reporte con Groq (gratis)...")
+    report_content = generate_status_report_with_groq(last_metrics, historical)
     print("[+] Reporte generado")
     print("\n" + "="*60)
     print(report_content)

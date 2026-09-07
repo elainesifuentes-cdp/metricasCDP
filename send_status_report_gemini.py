@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Rovo Agent: Lee Google Sheet y genera Status Report narrativo con Groq.
+Rovo Agent: Lee Google Sheet y genera Status Report con Google Gemini.
 Envía email desde cuenta corporativa CDPE.
 
-Groq es GRATIS y no requiere pago.
+Gemini es GRATIS y estable.
 """
 
 import os
@@ -15,7 +15,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from groq import Groq
+import google.generativeai as genai
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -31,8 +31,8 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-# Groq API
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
 # ============================================================================
@@ -98,68 +98,76 @@ def read_historical_metrics(service) -> Dict:
 
 
 # ============================================================================
-# GROQ - Generar reporte narrativo
+# GEMINI - Generar reporte narrativo
 # ============================================================================
 
-def generate_status_report_with_groq(last_metrics: Dict, historical: Dict) -> str:
+def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict) -> str:
     """
-    Usa Groq para generar un reporte narrativo automático.
-    Groq es GRATIS: https://groq.com/
+    Usa Google Gemini para generar un reporte narrativo automático.
+    Gemini es GRATIS: https://ai.google.dev/
     """
-    client = Groq(api_key=GROQ_API_KEY)
-    
-    # Preparar contexto para Groq
-    context = f"""
-    Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
-    
-    DATOS ESTA SEMANA:
-    - Timestamp: {last_metrics.get('Timestamp', 'N/A')}
-    - Puntos completados: {last_metrics.get('Puntos Completados', 'N/A')}
-    - Items completados: {last_metrics.get('Items Completados', 'N/A')}
-    - En progreso: {last_metrics.get('En Progreso', 'N/A')}
-    - Bloqueados: {last_metrics.get('Bloqueados', 'N/A')}
-    - Detalles bloqueados: {last_metrics.get('Detalles Bloqueados', 'N/A')}
-    - PTO: {last_metrics.get('PTO', 'Sin PTO')}
-    - Notas: {last_metrics.get('Notas', 'N/A')}
-    
-    HISTÓRICO (últimas 8 semanas):
-    {json.dumps(historical.get('rows', []), ensure_ascii=False, indent=2)}
-    
-    Genera un reporte ejecutivo en formato EMAIL que:
-    1. Resuma el status esta semana (velocity, bloqueados, PTO)
-    2. Analice tendencias (¿mejoramos o empeoramos?)
-    3. Destaque riesgos y bloqueantes principales
-    4. Dé recomendaciones accionables
-    5. Sea conciso (máximo 15 líneas)
-    6. Usa emojis para visual
-    
-    Formato:
-    📊 STATUS SEMANAL - [FECHA]
-    
-    [Párrafo 1: Resumen ejecutivo]
-    
-    ✅ Logros:
-    [Puntos clave]
-    
-    ⚠️ Riesgos:
-    [Puntos bloqueados]
-    
-    🎯 Acciones recomendadas:
-    [Puntos accionables]
-    
-    📈 Tendencia:
-    [Análisis histórico]
-    """
-    
-    message = client.chat.completions.create(
-        model="llama-3.1-70b-versatile",  # Modelo gratuito de Groq (activo)
-        max_tokens=1024,
-        messages=[
-            {"role": "user", "content": context}
-        ]
-    )
-    
-    return message.choices[0].message.content
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")  # Modelo gratis de Gemini
+        
+        # Preparar contexto para Gemini
+        context = f"""
+        Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
+        
+        DATOS ESTA SEMANA:
+        - Timestamp: {last_metrics.get('Timestamp', 'N/A')}
+        - Puntos completados: {last_metrics.get('Puntos Completados', 'N/A')}
+        - Items completados: {last_metrics.get('Items Completados', 'N/A')}
+        - En progreso: {last_metrics.get('En Progreso', 'N/A')}
+        - Bloqueados: {last_metrics.get('Bloqueados', 'N/A')}
+        - Detalles bloqueados: {last_metrics.get('Detalles Bloqueados', 'N/A')}
+        - PTO: {last_metrics.get('PTO', 'Sin PTO')}
+        - Notas: {last_metrics.get('Notas', 'N/A')}
+        
+        Genera un reporte ejecutivo conciso (máximo 15 líneas) con:
+        1. Resumen velocity + bloqueados
+        2. Tendencias
+        3. Riesgos
+        4. Recomendaciones
+        
+        Formato:
+        📊 STATUS SEMANAL
+        
+        ✅ Logros: [puntos]
+        ⚠️ Riesgos: [puntos]
+        🎯 Acciones: [puntos]
+        📈 Tendencia: [análisis]
+        
+        Usa emojis y sé conciso.
+        """
+        
+        response = model.generate_content(context)
+        return response.text
+        
+    except Exception as e:
+        print(f"[!] Gemini falló ({str(e)[:50]}...), usando template simple")
+        return generate_simple_report(last_metrics, historical)
+
+
+def generate_simple_report(last_metrics: Dict, historical: Dict) -> str:
+    """Template simple si Gemini falla."""
+    return f"""
+📊 STATUS SEMANAL - {last_metrics.get('Timestamp', 'Esta semana')}
+
+✅ Logros:
+- {last_metrics.get('Puntos Completados', 'N/A')} puntos completados
+- {last_metrics.get('Items Completados', 'N/A')} items completados
+
+⚠️ Estado:
+- En progreso: {last_metrics.get('En Progreso', 'N/A')} items
+- Bloqueados: {last_metrics.get('Bloqueados', 'N/A')} items
+- PTO: {last_metrics.get('PTO', 'Sin PTO')}
+
+📝 Notas: {last_metrics.get('Notas', 'Sin comentarios')}
+
+---
+Reporte generado automáticamente
+"""
 
 
 # ============================================================================
@@ -182,7 +190,7 @@ def send_status_email(subject: str, html_body: str, recipient: str) -> bool:
         {html_body}
         
         ---
-        Generado automáticamente por Rovo Agent con Groq (gratis)
+        Generado automáticamente por Rovo Agent con Gemini (gratis)
         """
         part1 = MIMEText(text_body, "plain")
         
@@ -229,15 +237,15 @@ def send_status_email(subject: str, html_body: str, recipient: str) -> bool:
 
 def main():
     """Orquesta lectura de Sheet, generación de reporte y envío de email."""
-    print("[*] Iniciando Rovo Agent - Status Report (Groq)...")
+    print("[*] Iniciando Rovo Agent - Status Report (Gemini)...")
     
     # Validar variables de entorno
     if not all([GOOGLE_SHEETS_ID, GOOGLE_CREDENTIALS_JSON, 
-                SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GROQ_API_KEY]):
+                SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GEMINI_API_KEY]):
         raise ValueError(
             "Faltan variables de entorno: "
             "GOOGLE_SHEETS_ID, GOOGLE_CREDENTIALS_JSON, "
-            "SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GROQ_API_KEY"
+            "SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, GEMINI_API_KEY"
         )
     
     # Leer datos del Sheet
@@ -252,9 +260,9 @@ def main():
     
     print("[+] Datos leídos exitosamente")
     
-    # Generar reporte con Groq
-    print("[*] Generando reporte con Groq (gratis)...")
-    report_content = generate_status_report_with_groq(last_metrics, historical)
+    # Generar reporte con Gemini
+    print("[*] Generando reporte con Gemini (gratis)...")
+    report_content = generate_status_report_with_gemini(last_metrics, historical)
     print("[+] Reporte generado")
     print("\n" + "="*60)
     print(report_content)

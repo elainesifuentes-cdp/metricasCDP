@@ -40,17 +40,17 @@ jobs:
       - name: Wait 30 seconds (para que Google Sheet actualice)
         run: sleep 30
       
-      # PASO 2: Generar reporte con Groq (GRATIS) y enviar email
-      - name: Generate status report with Groq Agent
+      # PASO 2: Generar reporte con Gemini (GRATIS) y enviar email
+      - name: Generate status report with Gemini Agent
         env:
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python send_status_report_groq.py
+          python send_status_report_gemini.py
       
       - name: Notify on success
         if: success()

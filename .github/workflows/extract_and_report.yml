@@ -6,6 +6,15 @@ on:
     - cron: '0 9 * * FRI'
   # Permite ejecutar manualmente desde la UI
   workflow_dispatch:
+    inputs:
+      sprint_id:
+        description: 'ID del sprint de Jira a reportar (vacío = sprint activo)'
+        required: false
+        default: ''
+      report_sprint:
+        description: "Nombre (o parte) del sprint para el email (vacío = última fila cargada)"
+        required: false
+        default: ''
 
 jobs:
   extract_and_report:
@@ -34,6 +43,7 @@ jobs:
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           GOOGLE_SHEETS_ID: ${{ secrets.GOOGLE_SHEETS_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          JIRA_SPRINT_ID: ${{ github.event.inputs.sprint_id }}
         run: |
           python extract_metrics.py
       
@@ -49,6 +59,7 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPORT_SPRINT: ${{ github.event.inputs.report_sprint }}
         run: |
           python send_status_report_gemini.py
       

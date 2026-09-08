@@ -19,11 +19,22 @@ Variables de entorno requeridas (se configuran como GitHub Secrets):
   JIRA_PROJECT_KEY       ej: CDPE
   GOOGLE_SHEETS_ID       ID del Google Sheet (de la URL)
   GOOGLE_CREDENTIALS_JSON  contenido completo del JSON de la Service Account
+
+Variables opcionales:
+  JIRA_SPRINT_ID        ID numérico de un sprint concreto de Jira. Si se define
+                        (o se pasa --sprint-id), se extraen las métricas de ese
+                        sprint en vez del sprint activo.
+
+Uso:
+  python extract_metrics.py                 # sprint activo (openSprints)
+  python extract_metrics.py --sprint-id 42  # sprint puntual por ID
+  python extract_metrics.py --list-sprints  # lista los sprints del proyecto y sus IDs
 """
 
 import os
 import sys
 import json
+import argparse
 from datetime import datetime, timezone
 
 import requests
@@ -121,9 +132,73 @@ def find_story_points_field(issue_fields: dict) -> float:
     return 0.0
 
 
-def get_sprint_metrics() -> dict:
+def get_sprint_name(sprint_id: str) -> str:
+    """Devuelve el nombre del sprint a partir de su ID (API Agile de Jira)."""
+    try:
+        resp = requests.get(
+            f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}",
+            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("name", f"Sprint {sprint_id}")
+    except requests.RequestException as exc:
+        print(f"AVISO: no se pudo resolver el nombre del sprint {sprint_id}: {exc}",
+              file=sys.stderr)
+        return f"Sprint {sprint_id}"
+
+
+def list_project_sprints() -> None:
+    """Imprime los sprints (id, estado, nombre) de los boards del proyecto."""
+    boards_resp = requests.get(
+        f"{JIRA_BASE_URL}/rest/agile/1.0/board",
+        auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+        headers={"Accept": "application/json"},
+        params={"projectKeyOrId": JIRA_PROJECT_KEY},
+        timeout=30,
+    )
+    boards_resp.raise_for_status()
+    boards = boards_resp.json().get("values", [])
+    if not boards:
+        print(f"No se encontraron boards para el proyecto {JIRA_PROJECT_KEY}.")
+        return
+
+    for board in boards:
+        board_id = board.get("id")
+        print(f"\nBoard {board_id} - {board.get('name', '')}")
+        start_at = 0
+        while True:
+            resp = requests.get(
+                f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint",
+                auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+                headers={"Accept": "application/json"},
+                params={"startAt": start_at, "maxResults": 50},
+                timeout=30,
+            )
+            if resp.status_code == 400:
+                print("  (el board no soporta sprints)")
+                break
+            resp.raise_for_status()
+            data = resp.json()
+            for sprint in data.get("values", []):
+                print(f"  id={sprint.get('id'):<8} {sprint.get('state', ''):<8} "
+                      f"{sprint.get('name', '')}")
+            if data.get("isLast", True):
+                break
+            start_at += len(data.get("values", []))
+
+
+def get_sprint_metrics(sprint_id: str | None = None) -> dict:
     # Traemos todos los campos para poder detectar story points sin conocer el ID exacto
-    jql = f'project = {JIRA_PROJECT_KEY} AND sprint in openSprints() ORDER BY updated DESC'
+    if sprint_id:
+        jql = (f'project = {JIRA_PROJECT_KEY} AND sprint = {sprint_id} '
+               f'ORDER BY updated DESC')
+        sprint_name = get_sprint_name(sprint_id)
+    else:
+        jql = (f'project = {JIRA_PROJECT_KEY} AND sprint in openSprints() '
+               f'ORDER BY updated DESC')
+        sprint_name = ""
     issues = jira_search(jql, fields=["*all"])
 
     completed_points = 0.0
@@ -135,6 +210,19 @@ def get_sprint_metrics() -> dict:
     for issue in issues:
         key = issue.get("key")
         f = issue.get("fields", {})
+
+        # Si no se pasó un sprint explícito, intentamos deducir el nombre del
+        # sprint activo desde el campo "sprint" de los issues (customfield con
+        # una lista de objetos sprint).
+        if not sprint_name:
+            for value in f.values():
+                if isinstance(value, list) and value and isinstance(value[0], dict) \
+                        and "state" in value[0] and "name" in value[0]:
+                    active = [s for s in value if s.get("state") == "active"]
+                    chosen = active[0] if active else value[-1]
+                    sprint_name = chosen.get("name", "")
+                    break
+
         status = f.get("status", {})
         status_name = status.get("name", "")
         status_category = status.get("statusCategory", {}).get("name", "")
@@ -151,6 +239,7 @@ def get_sprint_metrics() -> dict:
             in_progress_count += 1
 
     return {
+        "sprint_name": sprint_name,
         "completed_points": completed_points,
         "completed_count": completed_count,
         "in_progress_count": in_progress_count,
@@ -176,7 +265,7 @@ def write_to_sheet(row: list) -> None:
         worksheet = sheet.add_worksheet(title=RAW_SHEET_NAME, rows=1000, cols=10)
         worksheet.append_row(
             ["Timestamp", "Puntos completados", "Items completados",
-             "En progreso", "Bloqueados", "Detalles", "PTO", "Notas"]
+             "En progreso", "Bloqueados", "Detalles", "PTO", "Notas", "Sprint"]
         )
 
     worksheet.append_row(row)
@@ -187,8 +276,28 @@ def write_to_sheet(row: list) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"Extrayendo métricas de {JIRA_PROJECT_KEY} en {JIRA_DOMAIN}...")
-    metrics = get_sprint_metrics()
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--sprint-id", default=os.environ.get("JIRA_SPRINT_ID"),
+                        help="ID numérico de un sprint concreto de Jira. "
+                             "Por defecto usa el sprint activo (openSprints).")
+    parser.add_argument("--list-sprints", action="store_true",
+                        help="Lista los sprints del proyecto con sus IDs y sale.")
+    args = parser.parse_args()
+
+    if args.list_sprints:
+        list_project_sprints()
+        return
+
+    sprint_id = args.sprint_id or None
+    if sprint_id:
+        print(f"Extrayendo métricas del sprint {sprint_id} "
+              f"de {JIRA_PROJECT_KEY} en {JIRA_DOMAIN}...")
+    else:
+        print(f"Extrayendo métricas del sprint activo de "
+              f"{JIRA_PROJECT_KEY} en {JIRA_DOMAIN}...")
+
+    metrics = get_sprint_metrics(sprint_id)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -204,6 +313,7 @@ def main():
         metrics["blocked_details"],
         pto,
         "",
+        metrics["sprint_name"],
     ]
 
     print("Fila a escribir:", row)

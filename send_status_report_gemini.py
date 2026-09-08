@@ -24,6 +24,10 @@ import google.generativeai as genai
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
+# Opcional: nombre (o parte del nombre) del sprint a reportar. Si no se define,
+# se usa la última fila cargada en el Sheet (comportamiento por defecto).
+REPORT_SPRINT = os.getenv("REPORT_SPRINT", "").strip()
+
 # Email corporativo CDPE
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -52,45 +56,75 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=credentials)
 
 
+def _row_sprint(headers: List[str], row: List[str]) -> str:
+    """Devuelve el valor de la columna 'Sprint' de una fila, si existe."""
+    if "Sprint" not in headers:
+        return ""
+    idx = headers.index("Sprint")
+    return row[idx] if idx < len(row) else ""
+
+
 def read_last_metrics(service) -> Dict:
-    """Lee el último registro de métricas del Sheet."""
+    """Lee el registro de métricas del Sheet.
+
+    Si REPORT_SPRINT está definido, devuelve la última fila cuyo campo 'Sprint'
+    contenga ese texto (case-insensitive). Si no, la última fila cargada.
+    """
     result = service.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEETS_ID,
-        range="'Datos Brutos'!A:H"
+        range="'Datos Brutos'!A:I"
     ).execute()
-    
+
     values = result.get('values', [])
-    
+
     if len(values) < 2:
         return {}
-    
-    # Última fila de datos
+
     headers = values[0]
-    last_row = values[-1]
-    
+    data_rows = values[1:]
+
+    if REPORT_SPRINT:
+        matches = [r for r in data_rows
+                   if REPORT_SPRINT.lower() in _row_sprint(headers, r).lower()]
+        if not matches:
+            print(f"[✗] No hay filas para el sprint '{REPORT_SPRINT}' en el Sheet")
+            return {}
+        target_row = matches[-1]
+    else:
+        target_row = data_rows[-1]
+
     # Mapear a diccionario
     data = {}
     for i, header in enumerate(headers):
-        if i < len(last_row):
-            data[header] = last_row[i]
+        if i < len(target_row):
+            data[header] = target_row[i]
         else:
             data[header] = ""
-    
+
     return data
 
 
 def read_historical_metrics(service) -> Dict:
-    """Lee histórico de últimas 8 semanas."""
+    """Lee histórico de últimas 8 semanas (filtrado por sprint si corresponde)."""
     result = service.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEETS_ID,
-        range="'Datos Brutos'!A:E"
+        range="'Datos Brutos'!A:I"
     ).execute()
-    
+
     values = result.get('values', [])
-    
-    # Últimas 8 filas (últimas 8 semanas)
-    historical = values[-8:] if len(values) > 1 else []
-    
+    if len(values) < 2:
+        return {"rows": [], "count": 0}
+
+    headers = values[0]
+    data_rows = values[1:]
+
+    if REPORT_SPRINT:
+        data_rows = [r for r in data_rows
+                     if REPORT_SPRINT.lower() in _row_sprint(headers, r).lower()]
+
+    # Encabezado + últimas 8 filas
+    historical = [headers] + data_rows[-8:]
+
     return {
         "rows": historical,
         "count": len(historical) - 1
@@ -115,6 +149,7 @@ def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict) -> 
         Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
         
         DATOS ESTA SEMANA:
+        - Sprint: {last_metrics.get('Sprint', 'N/A')}
         - Timestamp: {last_metrics.get('Timestamp', 'N/A')}
         - Puntos completados: {last_metrics.get('Puntos Completados', 'N/A')}
         - Items completados: {last_metrics.get('Items Completados', 'N/A')}
@@ -269,7 +304,10 @@ def main():
     print("="*60 + "\n")
     
     # Enviar email
-    subject = f"📊 Status Semanal - Métricas CDPE - {datetime.now().strftime('%d de %B, %Y')}"
+    sprint_label = last_metrics.get('Sprint', '') or REPORT_SPRINT
+    sprint_suffix = f" - {sprint_label}" if sprint_label else ""
+    subject = (f"📊 Status Semanal - Métricas CDPE{sprint_suffix} - "
+               f"{datetime.now().strftime('%d de %B, %Y')}")
     success = send_status_email(subject, report_content, RECIPIENT_EMAIL)
     
     if success:

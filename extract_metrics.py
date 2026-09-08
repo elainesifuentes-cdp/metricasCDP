@@ -12,6 +12,13 @@ Métricas extraídas:
   - Items bloqueados (count + detalle de razones)
   - PTO (placeholder manual por ahora)
 
+Hojas que escribe en el Google Sheet:
+  - "Datos Brutos"       : una fila por corrida con el resumen del sprint
+  - "Velocidad por Dev"  : una fila por (corrida, desarrollador) con horas
+                           planificadas vs completadas y varianza
+  - "Tareas sin tiempo"  : una fila por issue del sprint al que le falta la
+                           estimación original o el registro de tiempo trabajado
+
 Variables de entorno requeridas (se configuran como GitHub Secrets):
   JIRA_DOMAIN            ej: centraldepasajes.atlassian.net
   JIRA_EMAIL             email de Atlassian usado para autenticar
@@ -61,8 +68,10 @@ JIRA_PROJECT_KEY = get_env("JIRA_PROJECT_KEY")
 GOOGLE_SHEETS_ID = get_env("GOOGLE_SHEETS_ID")
 GOOGLE_CREDENTIALS_JSON = get_env("GOOGLE_CREDENTIALS_JSON")
 
-# Nombre de la hoja donde el script escribe cada fila
+# Nombres de las hojas donde el script escribe
 RAW_SHEET_NAME = "Datos Brutos"
+PER_DEV_SHEET_NAME = "Velocidad por Dev"
+MISSING_TIMES_SHEET_NAME = "Tareas sin tiempo"
 
 # Status que se consideran "bloqueado" en el workflow de Jira
 BLOCKED_STATUSES = {"Bloqueado"}
@@ -85,6 +94,14 @@ _DEFAULT_EXCLUDED_DONE = [
 EXCLUDED_DONE_STATUSES = {
     s.strip().lower()
     for s in os.environ.get("EXCLUDED_STATUSES", ",".join(_DEFAULT_EXCLUDED_DONE)).split(",")
+    if s.strip()
+}
+
+# Tipos de issue que NO se listan como "tarea sin tiempo" (los épicas nunca
+# llevan estimación). Configurable con MISSING_TIMES_EXCLUDE_TYPES.
+MISSING_TIMES_EXCLUDE_TYPES = {
+    s.strip().lower()
+    for s in os.environ.get("MISSING_TIMES_EXCLUDE_TYPES", "epic,épica,epica").split(",")
     if s.strip()
 }
 
@@ -144,6 +161,21 @@ def get_original_estimate_hours(issue_fields: dict) -> float:
     if not isinstance(seconds, (int, float)):
         return 0.0
     return round(seconds / 3600, 2)
+
+
+def get_time_spent_hours(issue_fields: dict) -> float:
+    """Tiempo trabajado registrado (worklogs) en horas. 0 si no hay registro."""
+    seconds = issue_fields.get("timespent")
+    if not isinstance(seconds, (int, float)):
+        seconds = issue_fields.get("timetracking", {}).get("timeSpentSeconds")
+    if not isinstance(seconds, (int, float)):
+        return 0.0
+    return round(seconds / 3600, 2)
+
+
+def get_assignee_name(issue_fields: dict) -> str:
+    assignee = issue_fields.get("assignee") or {}
+    return assignee.get("displayName") or "Sin asignar"
 
 
 def get_sprint_name(sprint_id: str) -> str:
@@ -240,6 +272,14 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
     blocked_details = []
     status_breakdown: dict[str, int] = {}
 
+    # Acumuladores por desarrollador y lista de issues con datos de tiempo faltantes
+    def _new_dev() -> dict:
+        return {"items_total": 0, "items_done": 0,
+                "plan_hours": 0.0, "done_hours": 0.0, "sin_estimacion": 0}
+
+    per_dev: dict[str, dict] = {}
+    missing_times: list[dict] = []
+
     for idx, issue in enumerate(issues):
         key = issue.get("key")
         f = issue.get("fields", {})
@@ -264,7 +304,11 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         status_name = status.get("name", "")
         status_category = status.get("statusCategory", {}).get("key", "")
         resolution_name = (f.get("resolution") or {}).get("name", "")
+        summary = f.get("summary", "")
+        assignee = get_assignee_name(f)
+        issue_type = (f.get("issuetype") or {}).get("name", "")
         est_hours = get_original_estimate_hours(f)
+        spent_hours = get_time_spent_hours(f)
 
         status_breakdown[status_name] = status_breakdown.get(status_name, 0) + 1
 
@@ -272,16 +316,41 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
             status_name.lower() in EXCLUDED_DONE_STATUSES
             or resolution_name.lower() in EXCLUDED_DONE_STATUSES
         )
+        is_done = status_category == DONE_CATEGORY_KEY and not is_discarded
 
+        # ----- Acumulado por desarrollador -----
+        if not is_discarded:
+            dev = per_dev.setdefault(assignee, _new_dev())
+            dev["items_total"] += 1
+            dev["plan_hours"] += est_hours
+            if est_hours == 0:
+                dev["sin_estimacion"] += 1
+            if is_done:
+                dev["items_done"] += 1
+                dev["done_hours"] += est_hours
+
+        # ----- Datos de tiempo faltantes (solo issues vigentes, no descartados) -----
+        if not is_discarded and issue_type.lower() not in MISSING_TIMES_EXCLUDE_TYPES:
+            if est_hours == 0:
+                missing_times.append({
+                    "key": key, "summary": summary, "assignee": assignee,
+                    "problema": "Falta estimación original",
+                })
+            if is_done and spent_hours == 0:
+                missing_times.append({
+                    "key": key, "summary": summary, "assignee": assignee,
+                    "problema": "Completada sin registrar tiempo",
+                })
+
+        # ----- Conteos globales -----
         if status_name in BLOCKED_STATUSES:
             blocked_count += 1
-            summary = f.get("summary", "")
             blocked_details.append(f"{key}: {summary} (status: {status_name})")
         elif status_category == DONE_CATEGORY_KEY and is_discarded:
             discarded_count += 1
             etiqueta = resolution_name or status_name
             discarded_breakdown[etiqueta] = discarded_breakdown.get(etiqueta, 0) + 1
-        elif status_category == DONE_CATEGORY_KEY:
+        elif is_done:
             completed_count += 1
             completed_hours += est_hours
             if est_hours > 0:
@@ -290,6 +359,14 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
                 completed_without_estimate.append(key)
         elif status_category == IN_PROGRESS_CATEGORY_KEY:
             in_progress_count += 1
+
+    # Redondeo final de acumuladores por dev + varianza
+    for dev, d in per_dev.items():
+        d["plan_hours"] = round(d["plan_hours"], 2)
+        d["done_hours"] = round(d["done_hours"], 2)
+        d["varianza_h"] = round(d["done_hours"] - d["plan_hours"], 2)
+        d["varianza_pct"] = (round(d["done_hours"] / d["plan_hours"] * 100 - 100, 1)
+                             if d["plan_hours"] else "")
 
     print("Desglose por status:", status_breakdown)
     if discarded_count:
@@ -301,6 +378,12 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         muestra = ", ".join(completed_without_estimate[:15])
         print(f"Completados SIN estimación ({len(completed_without_estimate)}): {muestra}"
               + (" ..." if len(completed_without_estimate) > 15 else ""))
+    print(f"Tareas con datos de tiempo faltantes: {len(missing_times)}")
+    print("Velocidad por dev (plan_h -> done_h):")
+    for dev, d in sorted(per_dev.items(), key=lambda kv: -kv[1]["done_hours"]):
+        print(f"  {dev}: {d['plan_hours']} -> {d['done_hours']} h "
+              f"(var {d['varianza_h']} h), items {d['items_done']}/{d['items_total']}, "
+              f"sin estimación {d['sin_estimacion']}")
 
     return {
         "sprint_name": sprint_name,
@@ -309,6 +392,8 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         "in_progress_count": in_progress_count,
         "blocked_count": blocked_count,
         "blocked_details": "; ".join(blocked_details) if blocked_details else "",
+        "per_dev": per_dev,
+        "missing_times": missing_times,
     }
 
 
@@ -316,23 +401,67 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
 # Google Sheets
 # ---------------------------------------------------------------------------
 
-def write_to_sheet(row: list) -> None:
+def open_spreadsheet():
     creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
     client = gspread.authorize(credentials)
+    return client.open_by_key(GOOGLE_SHEETS_ID)
 
-    sheet = client.open_by_key(GOOGLE_SHEETS_ID)
+
+def _get_or_create_ws(sheet, name: str, header: list[str]):
     try:
-        worksheet = sheet.worksheet(RAW_SHEET_NAME)
+        return sheet.worksheet(name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title=RAW_SHEET_NAME, rows=1000, cols=10)
-        worksheet.append_row(
-            ["Timestamp", "Horas completadas", "Items completados",
-             "En progreso", "Bloqueados", "Detalles", "PTO", "Notas", "Sprint"]
-        )
+        ws = sheet.add_worksheet(title=name, rows=1000, cols=max(10, len(header)))
+        ws.append_row(header)
+        return ws
 
-    worksheet.append_row(row)
+
+def write_summary_row(sheet, row: list) -> None:
+    ws = _get_or_create_ws(sheet, RAW_SHEET_NAME,
+        ["Timestamp", "Horas completadas", "Items completados",
+         "En progreso", "Bloqueados", "Detalles", "PTO", "Notas", "Sprint"])
+    ws.append_row(row)
+
+
+def write_per_dev_rows(sheet, timestamp: str, sprint_name: str,
+                       per_dev: dict) -> None:
+    ws = _get_or_create_ws(sheet, PER_DEV_SHEET_NAME,
+        ["Timestamp", "Sprint", "Desarrollador", "Items totales",
+         "Items completados", "Horas planificadas", "Horas completadas",
+         "Varianza h", "Varianza %", "Tareas sin estimación"])
+
+    filas = []
+    tot = {"items_total": 0, "items_done": 0, "plan_hours": 0.0,
+           "done_hours": 0.0, "sin_estimacion": 0}
+    for dev, d in sorted(per_dev.items(), key=lambda kv: -kv[1]["done_hours"]):
+        filas.append([timestamp, sprint_name, dev, d["items_total"],
+                      d["items_done"], d["plan_hours"], d["done_hours"],
+                      d["varianza_h"], d["varianza_pct"], d["sin_estimacion"]])
+        for k in tot:
+            tot[k] += d[k]
+
+    tot_plan = round(tot["plan_hours"], 2)
+    tot_done = round(tot["done_hours"], 2)
+    filas.append([timestamp, sprint_name, "— EQUIPO —", tot["items_total"],
+                  tot["items_done"], tot_plan, tot_done,
+                  round(tot_done - tot_plan, 2),
+                  round(tot_done / tot_plan * 100 - 100, 1) if tot_plan else "",
+                  tot["sin_estimacion"]])
+
+    if filas:
+        ws.append_rows(filas)
+
+
+def write_missing_times_rows(sheet, timestamp: str, sprint_name: str,
+                             missing: list[dict]) -> None:
+    ws = _get_or_create_ws(sheet, MISSING_TIMES_SHEET_NAME,
+        ["Timestamp", "Sprint", "Issue", "Resumen", "Responsable", "Problema"])
+    filas = [[timestamp, sprint_name, m["key"], m["summary"],
+              m["assignee"], m["problema"]] for m in missing]
+    if filas:
+        ws.append_rows(filas)
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +510,16 @@ def main():
     ]
 
     print("Fila a escribir:", row)
-    write_to_sheet(row)
-    print("Listo. Fila agregada a la hoja 'Datos Brutos'.")
+    sheet = open_spreadsheet()
+    write_summary_row(sheet, row)
+    print(f"Listo. Fila agregada a '{RAW_SHEET_NAME}'.")
+
+    write_per_dev_rows(sheet, timestamp, metrics["sprint_name"], metrics["per_dev"])
+    print(f"'{PER_DEV_SHEET_NAME}': {len(metrics['per_dev'])} devs + total.")
+
+    write_missing_times_rows(sheet, timestamp, metrics["sprint_name"],
+                             metrics["missing_times"])
+    print(f"'{MISSING_TIMES_SHEET_NAME}': {len(metrics['missing_times'])} filas.")
 
 
 if __name__ == "__main__":

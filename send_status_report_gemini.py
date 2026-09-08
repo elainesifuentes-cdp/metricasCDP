@@ -140,23 +140,101 @@ def read_historical_metrics(service) -> Dict:
     }
 
 
+def _read_tab(service, tab: str, rng: str = "A:Z") -> Dict:
+    """Lee una pestaña como {headers, rows}. rows son dicts header->valor."""
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=f"'{tab}'!{rng}"
+        ).execute()
+    except Exception as exc:  # pestaña inexistente u otro error
+        print(f"[!] No se pudo leer la pestaña '{tab}': {str(exc)[:80]}")
+        return {"headers": [], "rows": []}
+
+    values = result.get('values', [])
+    if len(values) < 2:
+        return {"headers": values[0] if values else [], "rows": []}
+
+    headers = values[0]
+    rows = []
+    for raw in values[1:]:
+        rows.append({h: (raw[i] if i < len(raw) else "") for i, h in enumerate(headers)})
+    return {"headers": headers, "rows": rows}
+
+
+def _latest_batch(rows: List[Dict]) -> List[Dict]:
+    """Filtra las filas del último Timestamp (y del sprint pedido, si aplica)."""
+    if REPORT_SPRINT:
+        rows = [r for r in rows if REPORT_SPRINT.lower() in str(r.get("Sprint", "")).lower()]
+    if not rows:
+        return []
+    last_ts = max(r.get("Timestamp", "") for r in rows)
+    return [r for r in rows if r.get("Timestamp", "") == last_ts]
+
+
+def read_per_dev(service) -> List[Dict]:
+    data = _read_tab(service, "Velocidad por Dev")
+    return _latest_batch(data["rows"])
+
+
+def read_missing_times(service) -> List[Dict]:
+    data = _read_tab(service, "Tareas sin tiempo")
+    return _latest_batch(data["rows"])
+
+
+def format_per_dev(rows: List[Dict]) -> str:
+    if not rows:
+        return "Sin datos de velocidad por desarrollador."
+    lineas = []
+    for r in rows:
+        lineas.append(
+            f"- {r.get('Desarrollador', '?')}: "
+            f"plan {r.get('Horas planificadas', '?')}h / "
+            f"completado {r.get('Horas completadas', '?')}h "
+            f"(var {r.get('Varianza h', '?')}h, {r.get('Varianza %', '?')}%), "
+            f"items {r.get('Items completados', '?')}/{r.get('Items totales', '?')}, "
+            f"sin estimación: {r.get('Tareas sin estimación', '0')}"
+        )
+    return "\n".join(lineas)
+
+
+def format_missing_times(rows: List[Dict]) -> str:
+    if not rows:
+        return "✅ Todas las tareas del sprint tienen estimación y registro de tiempo."
+    por_persona: Dict[str, List[str]] = {}
+    for r in rows:
+        persona = r.get("Responsable", "Sin asignar")
+        por_persona.setdefault(persona, []).append(
+            f"{r.get('Issue', '?')} — {r.get('Problema', '?')}"
+        )
+    lineas = [f"⚠️ {len(rows)} tareas con datos de tiempo faltantes:"]
+    for persona, items in sorted(por_persona.items()):
+        lineas.append(f"\n{persona}:")
+        lineas.extend(f"  - {it}" for it in items)
+    return "\n".join(lineas)
+
+
 # ============================================================================
 # GEMINI - Generar reporte narrativo
 # ============================================================================
 
-def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict) -> str:
+def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict,
+                                       per_dev: List[Dict],
+                                       missing_times: List[Dict]) -> str:
     """
     Usa Google Gemini para generar un reporte narrativo automático.
     Gemini es GRATIS: https://ai.google.dev/
     """
+    per_dev_txt = format_per_dev(per_dev)
+    missing_txt = format_missing_times(missing_times)
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel("gemini-1.5-flash")  # Modelo gratis de Gemini
-        
+
         # Preparar contexto para Gemini
         context = f"""
         Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
-        
+
         DATOS ESTA SEMANA:
         - Sprint: {_get(last_metrics, 'Sprint')}
         - Timestamp: {_get(last_metrics, 'Timestamp')}
@@ -168,32 +246,41 @@ def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict) -> 
         - PTO: {_get(last_metrics, 'PTO', default='Sin PTO')}
         - Notas: {_get(last_metrics, 'Notas')}
 
-        Genera un reporte ejecutivo conciso (máximo 15 líneas) con:
-        1. Resumen de avance (horas completadas + items) + bloqueados
-        2. Tendencias
-        3. Riesgos
-        4. Recomendaciones
-        
+        VELOCIDAD POR DESARROLLADOR (horas de estimación original):
+        {per_dev_txt}
+
+        TAREAS SIN DATOS DE TIEMPO:
+        {missing_txt}
+
+        Genera un reporte ejecutivo conciso con:
+        1. Resumen de avance del equipo (horas completadas vs planificadas + items) + bloqueados
+        2. Velocidad por desarrollador: destacá quién quedó por debajo/encima de lo planificado
+        3. Calidad de datos: mencioná las tareas sin estimación / sin registro de tiempo y a quién pedírselas
+        4. Riesgos y recomendaciones
+
         Formato:
         📊 STATUS SEMANAL
-        
-        ✅ Logros: [puntos]
-        ⚠️ Riesgos: [puntos]
-        🎯 Acciones: [puntos]
-        📈 Tendencia: [análisis]
-        
-        Usa emojis y sé conciso.
+
+        ✅ Avance del equipo: [...]
+        👤 Por desarrollador: [...]
+        🧹 Datos a completar: [...]
+        ⚠️ Riesgos: [...]
+        🎯 Acciones: [...]
+
+        Usa emojis y sé conciso. No inventes números: usá solo los datos provistos.
         """
-        
+
         response = model.generate_content(context)
         return response.text
-        
+
     except Exception as e:
         print(f"[!] Gemini falló ({str(e)[:50]}...), usando template simple")
-        return generate_simple_report(last_metrics, historical)
+        return generate_simple_report(last_metrics, historical, per_dev, missing_times)
 
 
-def generate_simple_report(last_metrics: Dict, historical: Dict) -> str:
+def generate_simple_report(last_metrics: Dict, historical: Dict,
+                           per_dev: List[Dict] = None,
+                           missing_times: List[Dict] = None) -> str:
     """Template simple si Gemini falla."""
     return f"""
 📊 STATUS SEMANAL - {last_metrics.get('Timestamp', 'Esta semana')}
@@ -206,6 +293,12 @@ def generate_simple_report(last_metrics: Dict, historical: Dict) -> str:
 - En progreso: {_get(last_metrics, 'En Progreso', 'En progreso')} items
 - Bloqueados: {_get(last_metrics, 'Bloqueados')} items
 - PTO: {_get(last_metrics, 'PTO', default='Sin PTO')}
+
+👤 Velocidad por desarrollador:
+{format_per_dev(per_dev or [])}
+
+🧹 Tareas sin datos de tiempo:
+{format_missing_times(missing_times or [])}
 
 📝 Notas: {last_metrics.get('Notas', 'Sin comentarios')}
 
@@ -243,7 +336,7 @@ def send_status_email(subject: str, html_body: str, recipient: str) -> bool:
         <html>
           <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
             <div style="background: #f5f5f5; padding: 20px; border-radius: 8px;">
-              {html_body}
+              <pre style="white-space: pre-wrap; font-family: inherit; margin: 0;">{html_body}</pre>
               <hr style="margin: 20px 0; border: none; border-top: 1px solid #ddd;">
               <p style="font-size: 12px; color: #999;">
                 Generado automáticamente por Rovo Agent | {datetime.now().strftime('%Y-%m-%d %H:%M')}
@@ -297,16 +390,19 @@ def main():
     sheets_service = get_sheets_service()
     last_metrics = read_last_metrics(sheets_service)
     historical = read_historical_metrics(sheets_service)
-    
+    per_dev = read_per_dev(sheets_service)
+    missing_times = read_missing_times(sheets_service)
+
     if not last_metrics:
         print("[✗] No hay datos en el Sheet")
         return
-    
-    print("[+] Datos leídos exitosamente")
-    
+
+    print(f"[+] Datos leídos: {len(per_dev)} devs, {len(missing_times)} tareas sin tiempo")
+
     # Generar reporte con Gemini
     print("[*] Generando reporte con Gemini (gratis)...")
-    report_content = generate_status_report_with_gemini(last_metrics, historical)
+    report_content = generate_status_report_with_gemini(
+        last_metrics, historical, per_dev, missing_times)
     print("[+] Reporte generado")
     print("\n" + "="*60)
     print(report_content)

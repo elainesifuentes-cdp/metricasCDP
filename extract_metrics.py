@@ -67,9 +67,11 @@ RAW_SHEET_NAME = "Datos Brutos"
 # Status que se consideran "bloqueado" en el workflow de Jira
 BLOCKED_STATUSES = {"Bloqueado"}
 
-# Categorías de status de Jira que cuentan como "Done"
-DONE_STATUS_CATEGORY = "Done"
-IN_PROGRESS_STATUS_CATEGORY = "In Progress"
+# Claves de categoría de status de Jira (independientes del idioma de la cuenta).
+# statusCategory.name cambia con el locale ("Done"/"Finalizada", etc.), pero
+# statusCategory.key siempre es "new" / "indeterminate" / "done".
+DONE_CATEGORY_KEY = "done"
+IN_PROGRESS_CATEGORY_KEY = "indeterminate"
 
 JIRA_BASE_URL = f"https://{JIRA_DOMAIN}"
 
@@ -199,17 +201,36 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         jql = (f'project = {JIRA_PROJECT_KEY} AND sprint in openSprints() '
                f'ORDER BY updated DESC')
         sprint_name = ""
+    print(f"JQL: {jql}")
     issues = jira_search(jql, fields=["*all"])
+    print(f"Issues encontrados: {len(issues)}")
+
+    # Diagnóstico: si no hubo resultados con un sprint explícito, probamos sin
+    # el filtro de proyecto para ver si los issues del sprint son de otro proyecto.
+    if not issues and sprint_id:
+        alt_jql = f'sprint = {sprint_id} ORDER BY updated DESC'
+        alt_issues = jira_search(alt_jql, fields=["project", "status"])
+        print(f"DEBUG sin filtro de proyecto ('{alt_jql}'): {len(alt_issues)} issues")
+        proyectos = {}
+        for it in alt_issues:
+            pk = it.get("fields", {}).get("project", {}).get("key", "?")
+            proyectos[pk] = proyectos.get(pk, 0) + 1
+        print(f"DEBUG proyectos en el sprint: {proyectos}")
 
     completed_points = 0.0
     completed_count = 0
     in_progress_count = 0
     blocked_count = 0
     blocked_details = []
+    status_breakdown: dict[str, int] = {}
 
-    for issue in issues:
+    for idx, issue in enumerate(issues):
         key = issue.get("key")
         f = issue.get("fields", {})
+
+        if idx == 0:
+            print(f"DEBUG primer issue {key}: status={json.dumps(f.get('status'), ensure_ascii=False)}")
+            print(f"DEBUG campos disponibles: {sorted(f.keys())}")
 
         # Si no se pasó un sprint explícito, intentamos deducir el nombre del
         # sprint activo desde el campo "sprint" de los issues (customfield con
@@ -225,18 +246,22 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
 
         status = f.get("status", {})
         status_name = status.get("name", "")
-        status_category = status.get("statusCategory", {}).get("name", "")
+        status_category = status.get("statusCategory", {}).get("key", "")
         points = find_story_points_field(f)
+
+        status_breakdown[status_name] = status_breakdown.get(status_name, 0) + 1
 
         if status_name in BLOCKED_STATUSES:
             blocked_count += 1
             summary = f.get("summary", "")
             blocked_details.append(f"{key}: {summary} (status: {status_name})")
-        elif status_category == DONE_STATUS_CATEGORY:
+        elif status_category == DONE_CATEGORY_KEY:
             completed_count += 1
             completed_points += points
-        elif status_category == IN_PROGRESS_STATUS_CATEGORY:
+        elif status_category == IN_PROGRESS_CATEGORY_KEY:
             in_progress_count += 1
+
+    print("Desglose por status:", status_breakdown)
 
     return {
         "sprint_name": sprint_name,

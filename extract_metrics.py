@@ -6,7 +6,7 @@ Extrae métricas semanales del sprint activo de Jira Cloud (proyecto CDPE)
 y las escribe como una nueva fila en la hoja "Datos Brutos" de un Google Sheet.
 
 Métricas extraídas:
-  - Puntos completados (story points de issues Done en el sprint activo)
+  - Horas completadas (suma de estimación original de issues Done en el sprint)
   - Items completados (count)
   - Items en progreso (count)
   - Items bloqueados (count + detalle de razones)
@@ -115,23 +115,20 @@ def jira_search(jql: str, fields: list[str]) -> list[dict]:
     return issues
 
 
-def find_story_points_field(issue_fields: dict) -> float:
+def get_original_estimate_hours(issue_fields: dict) -> float:
     """
-    El campo de Story Points en Jira Cloud es un custom field cuyo ID varía
-    por instancia (normalmente customfield_10016, pero no es fijo).
-    Buscamos el primer customfield numérico razonable como fallback si
-    JIRA_STORY_POINTS_FIELD no está seteado explícitamente.
+    Devuelve la estimación original del issue en horas.
+
+    En Jira Cloud la estimación original es el campo estándar
+    `timeoriginalestimate` (en segundos). Como fallback se usa
+    `timetracking.originalEstimateSeconds`.
     """
-    explicit_field = os.environ.get("JIRA_STORY_POINTS_FIELD")
-    if explicit_field and explicit_field in issue_fields:
-        value = issue_fields.get(explicit_field)
-        return float(value) if value is not None else 0.0
-
-    for key, value in issue_fields.items():
-        if key.startswith("customfield_") and isinstance(value, (int, float)):
-            return float(value)
-
-    return 0.0
+    seconds = issue_fields.get("timeoriginalestimate")
+    if not isinstance(seconds, (int, float)):
+        seconds = issue_fields.get("timetracking", {}).get("originalEstimateSeconds")
+    if not isinstance(seconds, (int, float)):
+        return 0.0
+    return round(seconds / 3600, 2)
 
 
 def get_sprint_name(sprint_id: str) -> str:
@@ -192,7 +189,7 @@ def list_project_sprints() -> None:
 
 
 def get_sprint_metrics(sprint_id: str | None = None) -> dict:
-    # Traemos todos los campos para poder detectar story points sin conocer el ID exacto
+    # Traemos todos los campos (incluye la estimación original de tiempo)
     if sprint_id:
         jql = (f'project = {JIRA_PROJECT_KEY} AND sprint = {sprint_id} '
                f'ORDER BY updated DESC')
@@ -217,7 +214,7 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
             proyectos[pk] = proyectos.get(pk, 0) + 1
         print(f"DEBUG proyectos en el sprint: {proyectos}")
 
-    completed_points = 0.0
+    completed_hours = 0.0
     completed_count = 0
     in_progress_count = 0
     blocked_count = 0
@@ -247,7 +244,7 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         status = f.get("status", {})
         status_name = status.get("name", "")
         status_category = status.get("statusCategory", {}).get("key", "")
-        points = find_story_points_field(f)
+        est_hours = get_original_estimate_hours(f)
 
         status_breakdown[status_name] = status_breakdown.get(status_name, 0) + 1
 
@@ -257,7 +254,7 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
             blocked_details.append(f"{key}: {summary} (status: {status_name})")
         elif status_category == DONE_CATEGORY_KEY:
             completed_count += 1
-            completed_points += points
+            completed_hours += est_hours
         elif status_category == IN_PROGRESS_CATEGORY_KEY:
             in_progress_count += 1
 
@@ -265,7 +262,7 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
 
     return {
         "sprint_name": sprint_name,
-        "completed_points": completed_points,
+        "completed_hours": completed_hours,
         "completed_count": completed_count,
         "in_progress_count": in_progress_count,
         "blocked_count": blocked_count,
@@ -289,7 +286,7 @@ def write_to_sheet(row: list) -> None:
     except gspread.exceptions.WorksheetNotFound:
         worksheet = sheet.add_worksheet(title=RAW_SHEET_NAME, rows=1000, cols=10)
         worksheet.append_row(
-            ["Timestamp", "Puntos completados", "Items completados",
+            ["Timestamp", "Horas completadas", "Items completados",
              "En progreso", "Bloqueados", "Detalles", "PTO", "Notas", "Sprint"]
         )
 
@@ -331,7 +328,7 @@ def main():
 
     row = [
         timestamp,
-        metrics["completed_points"],
+        metrics["completed_hours"],
         metrics["completed_count"],
         metrics["in_progress_count"],
         metrics["blocked_count"],

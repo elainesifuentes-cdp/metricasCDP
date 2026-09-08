@@ -56,6 +56,15 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=credentials)
 
 
+def _get(metrics: Dict, *keys: str, default: str = "N/A") -> str:
+    """Devuelve el primer valor no vacío entre varios nombres de columna posibles."""
+    for k in keys:
+        v = metrics.get(k)
+        if v not in (None, ""):
+            return v
+    return default
+
+
 def _row_sprint(headers: List[str], row: List[str]) -> str:
     """Devuelve el valor de la columna 'Sprint' de una fila, si existe."""
     if "Sprint" not in headers:
@@ -149,18 +158,18 @@ def generate_status_report_with_gemini(last_metrics: Dict, historical: Dict) -> 
         Eres un PM/Delivery Manager que genera reportes semanales de métricas de desarrollo.
         
         DATOS ESTA SEMANA:
-        - Sprint: {last_metrics.get('Sprint', 'N/A')}
-        - Timestamp: {last_metrics.get('Timestamp', 'N/A')}
-        - Puntos completados: {last_metrics.get('Puntos Completados', 'N/A')}
-        - Items completados: {last_metrics.get('Items Completados', 'N/A')}
-        - En progreso: {last_metrics.get('En Progreso', 'N/A')}
-        - Bloqueados: {last_metrics.get('Bloqueados', 'N/A')}
-        - Detalles bloqueados: {last_metrics.get('Detalles Bloqueados', 'N/A')}
-        - PTO: {last_metrics.get('PTO', 'Sin PTO')}
-        - Notas: {last_metrics.get('Notas', 'N/A')}
-        
+        - Sprint: {_get(last_metrics, 'Sprint')}
+        - Timestamp: {_get(last_metrics, 'Timestamp')}
+        - Horas completadas (estimación original): {_get(last_metrics, 'Horas completadas', 'Horas Completadas', 'Puntos Completados', 'Puntos completados')}
+        - Items completados: {_get(last_metrics, 'Items Completados', 'Items completados')}
+        - En progreso: {_get(last_metrics, 'En Progreso', 'En progreso')}
+        - Bloqueados: {_get(last_metrics, 'Bloqueados')}
+        - Detalles bloqueados: {_get(last_metrics, 'Detalles Bloqueados', 'Detalles')}
+        - PTO: {_get(last_metrics, 'PTO', default='Sin PTO')}
+        - Notas: {_get(last_metrics, 'Notas')}
+
         Genera un reporte ejecutivo conciso (máximo 15 líneas) con:
-        1. Resumen velocity + bloqueados
+        1. Resumen de avance (horas completadas + items) + bloqueados
         2. Tendencias
         3. Riesgos
         4. Recomendaciones
@@ -190,13 +199,13 @@ def generate_simple_report(last_metrics: Dict, historical: Dict) -> str:
 📊 STATUS SEMANAL - {last_metrics.get('Timestamp', 'Esta semana')}
 
 ✅ Logros:
-- {last_metrics.get('Puntos Completados', 'N/A')} puntos completados
-- {last_metrics.get('Items Completados', 'N/A')} items completados
+- {_get(last_metrics, 'Horas completadas', 'Horas Completadas', 'Puntos Completados', 'Puntos completados')} horas completadas (estimación original)
+- {_get(last_metrics, 'Items Completados', 'Items completados')} items completados
 
 ⚠️ Estado:
-- En progreso: {last_metrics.get('En Progreso', 'N/A')} items
-- Bloqueados: {last_metrics.get('Bloqueados', 'N/A')} items
-- PTO: {last_metrics.get('PTO', 'Sin PTO')}
+- En progreso: {_get(last_metrics, 'En Progreso', 'En progreso')} items
+- Bloqueados: {_get(last_metrics, 'Bloqueados')} items
+- PTO: {_get(last_metrics, 'PTO', default='Sin PTO')}
 
 📝 Notas: {last_metrics.get('Notas', 'Sin comentarios')}
 

@@ -73,6 +73,21 @@ BLOCKED_STATUSES = {"Bloqueado"}
 DONE_CATEGORY_KEY = "done"
 IN_PROGRESS_CATEGORY_KEY = "indeterminate"
 
+# Issues que caen en categoría "done" pero NO representan trabajo entregado
+# (cancelados / descartados). Se excluyen del conteo de completados.
+# Se compara contra el nombre del status Y contra el de la resolución.
+# Configurable con la env var EXCLUDED_STATUSES (lista separada por comas).
+_DEFAULT_EXCLUDED_DONE = [
+    "won't do", "wont do", "no se hará", "no se hara", "no se realizará",
+    "cancelado", "cancelada", "descartado", "descartada",
+    "rechazado", "rechazada", "duplicado", "duplicada", "declined",
+]
+EXCLUDED_DONE_STATUSES = {
+    s.strip().lower()
+    for s in os.environ.get("EXCLUDED_STATUSES", ",".join(_DEFAULT_EXCLUDED_DONE)).split(",")
+    if s.strip()
+}
+
 JIRA_BASE_URL = f"https://{JIRA_DOMAIN}"
 
 
@@ -216,6 +231,10 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
 
     completed_hours = 0.0
     completed_count = 0
+    completed_with_estimate = 0
+    completed_without_estimate = []
+    discarded_count = 0
+    discarded_breakdown: dict[str, int] = {}
     in_progress_count = 0
     blocked_count = 0
     blocked_details = []
@@ -244,21 +263,44 @@ def get_sprint_metrics(sprint_id: str | None = None) -> dict:
         status = f.get("status", {})
         status_name = status.get("name", "")
         status_category = status.get("statusCategory", {}).get("key", "")
+        resolution_name = (f.get("resolution") or {}).get("name", "")
         est_hours = get_original_estimate_hours(f)
 
         status_breakdown[status_name] = status_breakdown.get(status_name, 0) + 1
+
+        is_discarded = (
+            status_name.lower() in EXCLUDED_DONE_STATUSES
+            or resolution_name.lower() in EXCLUDED_DONE_STATUSES
+        )
 
         if status_name in BLOCKED_STATUSES:
             blocked_count += 1
             summary = f.get("summary", "")
             blocked_details.append(f"{key}: {summary} (status: {status_name})")
+        elif status_category == DONE_CATEGORY_KEY and is_discarded:
+            discarded_count += 1
+            etiqueta = resolution_name or status_name
+            discarded_breakdown[etiqueta] = discarded_breakdown.get(etiqueta, 0) + 1
         elif status_category == DONE_CATEGORY_KEY:
             completed_count += 1
             completed_hours += est_hours
+            if est_hours > 0:
+                completed_with_estimate += 1
+            else:
+                completed_without_estimate.append(key)
         elif status_category == IN_PROGRESS_CATEGORY_KEY:
             in_progress_count += 1
 
     print("Desglose por status:", status_breakdown)
+    if discarded_count:
+        print(f"Descartados (no cuentan como completados): {discarded_count} "
+              f"{discarded_breakdown}")
+    print(f"Completados con estimación original: {completed_with_estimate}/"
+          f"{completed_count}  (suma = {completed_hours} h)")
+    if completed_without_estimate:
+        muestra = ", ".join(completed_without_estimate[:15])
+        print(f"Completados SIN estimación ({len(completed_without_estimate)}): {muestra}"
+              + (" ..." if len(completed_without_estimate) > 15 else ""))
 
     return {
         "sprint_name": sprint_name,
